@@ -1,6 +1,8 @@
 """四个步骤：plan / search / summarize / report
 
 每一步都是「读 ctx → 返回结果」的纯函数，可以单独测、单独重跑。
+Day 17 起所有 LLM 调用统一走 llm.chat（路由 / 缓存 / 记账 / 限并发），
+budget.spend 由 llm.chat 内部统一执行，这里不再重复计费。
 """
 
 import json
@@ -11,8 +13,10 @@ from typing import Any, Callable
 from openai import OpenAI
 
 import corpus
+import llm
 from infra import Budget, FatalError
 
+# 保留兼容：实际用哪个模型由 llm.pick_model(tier) 决定
 MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
 
 
@@ -72,27 +76,15 @@ def _parse_plan(raw: str) -> list[str]:
     return [str(q).strip() for q in data[:3]]
 
 
-def _spend(resp, budget: Budget) -> None:
-    """兼容不返回 usage 的接口，避免 AttributeError 把成功调用判成失败。"""
-    budget.spend(resp.usage.total_tokens if resp.usage else 0)
-
-
 def make_plan(client: OpenAI, budget: Budget) -> Step:
     def run(ctx: dict) -> list[str]:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[{
-                "role": "user",
-                "content": f"{PLAN_PROMPT}\n\n主题：{ctx['topic']}",
-            }],
-            temperature=0,
-            max_tokens=300,
-            timeout=30,
+        reply = llm.chat(
+            [{"role": "user", "content": f"{PLAN_PROMPT}\n\n主题：{ctx['topic']}"}],
+            step="plan", tier="small", max_tokens=300, budget=budget,
         )
-        _spend(resp, budget)
-        return _parse_plan(resp.choices[0].message.content.strip())
+        return _parse_plan(reply.text)
 
-    # 1 次调用，client 超时 30s，step 给 45s 余量
+    # 1 次调用；llm 层超时由 REQUEST_TIMEOUT 统一控制，线程池这层给 45s
     return Step("plan", run, retries=2, timeout=45)
 
 
@@ -122,18 +114,12 @@ def make_summarize(client: OpenAI, budget: Budget) -> Step:
             material = "\n\n".join(
                 f"[{h['source']}]\n{h['text'][:600]}" for h in hits
             )
-            resp = client.chat.completions.create(
-                model=MODEL,
-                messages=[{
-                    "role": "user",
-                    "content": f"{SUMMARY_PROMPT}\n\n资料：\n{material}\n\n问题：{q}",
-                }],
-                temperature=0,
-                max_tokens=400,
-                timeout=45,
+            reply = llm.chat(
+                [{"role": "user",
+                  "content": f"{SUMMARY_PROMPT}\n\n资料：\n{material}\n\n问题：{q}"}],
+                step="summarize", tier="big", max_tokens=400, budget=budget,
             )
-            _spend(resp, budget)
-            out[q] = resp.choices[0].message.content.strip()
+            out[q] = reply.text
         return out
 
     # 这里是 3 次串行调用！step 超时必须 >= 3 × 单次超时，
@@ -144,18 +130,11 @@ def make_summarize(client: OpenAI, budget: Budget) -> Step:
 def make_report(client: OpenAI, budget: Budget) -> Step:
     def run(ctx: dict) -> str:
         body = "\n\n".join(f"### {q}\n{a}" for q, a in ctx["summarize"].items())
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[{
-                "role": "user",
-                "content": f"{REPORT_PROMPT}\n\n主题：{ctx['topic']}\n\n{body}",
-            }],
-            temperature=0,
-            max_tokens=1200,
-            timeout=90,
+        reply = llm.chat(
+            [{"role": "user",
+              "content": f"{REPORT_PROMPT}\n\n主题：{ctx['topic']}\n\n{body}"}],
+            step="report", tier="big", max_tokens=1200, budget=budget,
         )
-        _spend(resp, budget)
-        return resp.choices[0].message.content.strip()
+        return reply.text
 
-    # step 超时要大于 client 超时 90s，边界相等会误超时
     return Step("report", run, retries=2, timeout=110)

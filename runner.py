@@ -7,6 +7,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -28,8 +29,9 @@ def run_pipeline(topic: str, budget: Budget, client: OpenAI) -> dict:
     ]
 
     ctx = {"topic": topic}
-    # 带毫秒：压测时即便两次运行挤在同一秒也不会互相覆盖产物
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+    # 毫秒 + 随机短码：并发时多个线程可能落在同一毫秒，
+    # 只靠时间戳会让 run_dir 撞车、产物互相覆盖（实测 6 并发时复现过）。
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3] + "-" + uuid4().hex[:6]
     run_dir = Path("runs") / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "input.txt").write_text(topic, encoding="utf-8")

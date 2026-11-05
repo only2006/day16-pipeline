@@ -12,5 +12,8 @@ wheels/
 # 密钥：绝不入库
 .env
 
-# 运行产物（每次运行都会生成，不该进仓库）
+# 运行产物
 runs/
+logs/
+cache.db
+cache.db-journal

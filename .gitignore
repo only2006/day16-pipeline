@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# 密钥：绝不入库
+.env
+
+# 运行产物（每次运行都会生成，不该进仓库）
+runs/

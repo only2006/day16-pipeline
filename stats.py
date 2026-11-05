@@ -1,5 +1,6 @@
 """成本报表：读 logs/calls.jsonl 出统计。"""
 
+import sqlite3
 import statistics
 from collections import defaultdict
 
@@ -59,7 +60,12 @@ def main() -> None:
         print("\n=== 延迟 ===")
         print(f"  P50 {p50}ms   P95 {p95}ms   最快 {lat[0]}ms   最慢 {lat[-1]}ms")
 
-    print(f"\n缓存库现有 {cache.size()} 条")
+    # cache.db 可能被外部占用或损坏，不能让整份报表在最后一行崩掉
+    try:
+        size: str | int = cache.size()
+    except sqlite3.DatabaseError:
+        size = "不可用（cache.db 损坏或被占用）"
+    print(f"\n缓存库现有 {size} 条")
 
 
 if __name__ == "__main__":

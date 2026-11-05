@@ -1,6 +1,6 @@
 """Day 16 · 三个基础设施：预算 / 重试 / 超时
 
-相对教程原版修了两处真 bug：
+相对教程原版修了三处真 bug：
 1. ``classify()`` 原本定义了却没人调用。SDK 抛出的 APITimeoutError /
    RateLimitError / APIStatusError 并不是 RetryableError，而 with_retry 只
    捕获 RetryableError —— 结果是「重试」形同虚设，原始异常还会直接冒到
@@ -8,6 +8,8 @@
 2. ``run_with_timeout`` 原先用 ``with ThreadPoolExecutor(...)``。future
    超时后 __exit__ 会执行 shutdown(wait=True)，阻塞主线程一直等底层调用
    结束，超时等于没设。改成显式 shutdown(wait=False)。
+3. Budget 的调用次数只在「事后」判断，max_calls=20 会放到第 21 次调用才
+   拦。新增 check(next_call=True) 事前预检，spend() 与 with_retry 都用。
 
 超时后后台线程杀不掉（Python 限制），所以每个 LLM 调用自身也必须带
 timeout=，两层配合才安全。
@@ -49,12 +51,19 @@ class Budget:
         self.start = time.time()
 
     def spend(self, tokens: int = 0) -> None:
+        self.check(next_call=True)      # 事前：再发一次会不会超过次数上限
         self.calls += 1
         self.tokens += tokens
-        self.check()
+        self.check()                    # 事后：token / 总耗时
 
-    def check(self) -> None:
-        if self.calls > self.max_calls:
+    def check(self, *, next_call: bool = False) -> None:
+        """检查是否超限。
+
+        next_call=True 用于「即将再发一次调用」的事前预检，把这一次也算进去；
+        否则 max_calls=20 时第 21 次调用才被拦（off-by-one）。
+        """
+        extra = 1 if next_call else 0
+        if self.calls + extra > self.max_calls:
             raise BudgetExceeded(f"调用次数超过上限 {self.max_calls}")
         if self.tokens > self.max_tokens:
             raise BudgetExceeded(f"token 超过上限 {self.max_tokens}")
@@ -116,12 +125,12 @@ def run_with_timeout(fn, seconds: float, *args, **kwargs):
 def with_retry(fn, *, retries: int = 3, base_delay: float = 1.0, budget: Budget):
     """指数退避重试（1s → 2s → 4s）。只重试 RetryableError。
 
-    这里是 classify() 唯一的调用点：SDK 原始异常先翻译再决定是否重试。
+    这里是 classify() 的主要调用点：SDK 原始异常先翻译再决定是否重试。
     FatalError / BudgetExceeded 直接上抛，不浪费配额和时间。
     """
     last: Exception | None = None
     for attempt in range(1, retries + 1):
-        budget.check()
+        budget.check(next_call=True)
         try:
             return fn(attempt)
         except (FatalError, BudgetExceeded):

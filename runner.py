@@ -114,7 +114,9 @@ def main() -> int:
         print("没有配置 DEEPSEEK_API_KEY")
         return 1
 
-    client = OpenAI(api_key=key, base_url=BASE_URL, timeout=60)
+    # max_retries=0：关掉 SDK 自带的 2 次自动重试，否则一次调用可能发 3 个
+    # 真实请求而 Budget 只记 1 次；重试统一由 infra.with_retry / llm 管理
+    client = OpenAI(api_key=key, base_url=BASE_URL, timeout=60, max_retries=0)
     budget = Budget(args.max_calls, args.max_tokens, args.max_seconds)
 
     try:

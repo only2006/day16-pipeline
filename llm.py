@@ -2,20 +2,30 @@
 
 所有步骤都走这里，成本才统计得全。
 
-相对教程加固：
-1. 独立 load_dotenv() —— 教程依赖 runner.py 顶层隐式加载，单独导入本模块会拿不到 key。
-2. resp.usage 可能为 None（部分兼容接口不返回），做了保护，不把成功调用判成崩溃。
+相对教程 / Day17 首版修复的护栏缺陷：
+1. 429 退避的 time.sleep 原先在 `with _semaphore` 内，抱着许可睡 2/4/8s，
+   其余线程全被堵住；现在 sleep 移到信号量外。
+2. OpenAI SDK 默认 max_retries=2，一次 create 可能发 3 个真实请求而 Budget
+   只记 1 次；现在统一设 max_retries=0，重试由本模块明确管理。
+3. 只捕获 RateLimitError，超时/连接失败/5xx 会绕过分类；现在复用
+   infra.classify() 统一判定可重试性。
+4. 缓存键不含 base_url，换中转端点会命中旧端点旧答案；现在纳入键。
+5. cache.get/put 在并发下会击穿（同 key 多线程同时 miss → 重复付费）；
+   现在用 per-key 锁做单飞 + double-check。
+6. 独立 load_dotenv()、resp.usage 为 None 保护（Day17 首版已有）。
 """
 
 import os
 import threading
 import time
+from contextlib import nullcontext
 
 from dotenv import load_dotenv
-from openai import OpenAI, RateLimitError
+from openai import OpenAI
 
 import cache
 import pricing
+from infra import RetryableError, classify
 from ledger import CallRecord, log_call, now_iso
 
 load_dotenv()
@@ -42,7 +52,7 @@ def client() -> OpenAI:
                 if not key:
                     raise RuntimeError("没有配置 DEEPSEEK_API_KEY")
                 _client = OpenAI(api_key=key, base_url=BASE_URL,
-                                 timeout=REQUEST_TIMEOUT)
+                                 timeout=REQUEST_TIMEOUT, max_retries=0)
     return _client
 
 
@@ -72,52 +82,33 @@ def pick_model(tier: str) -> str:
     return MODEL_SMALL if tier == "small" else MODEL_BIG
 
 
-def chat(
-    messages: list[dict],
-    *,
-    step: str = "",
-    tier: str = "big",
-    temperature: float = 0.0,
-    max_tokens: int = 800,
-    use_cache: bool = True,
-    budget=None,
-) -> Reply:
-    model = pick_model(tier)
-    key = cache.make_key(model, messages, temperature, max_tokens)
-
-    # ① 查缓存：只缓存确定性调用
-    can_cache = use_cache and temperature == 0
-    if can_cache:
-        hit = cache.get(key)
-        if hit:
-            if budget is not None:
-                budget.spend(0)                    # 命中不计 token，但计一次"调用"
-            log_call(CallRecord(
-                ts=now_iso(), step=step, model=model,
-                prompt_tokens=0, completion_tokens=0,
-                cost=0.0, cached=True, latency_ms=0,
-            ))
-            return Reply(hit["text"], model, 0, 0, 0.0, True, 0)
-
-    # ② 调 API（限并发 + 429 退避）
-    last_exc = None
+def _request(model: str, messages: list[dict], temperature: float,
+             max_tokens: int, step: str, budget) -> Reply:
+    """真正打 API：限并发 + 可重试异常退避 + 记账。不含缓存读写。"""
+    last_exc: Exception | None = None
     for attempt in range(1, 4):
-        with _semaphore:
-            t0 = time.perf_counter()
-            try:
+        try:
+            with _semaphore:
+                t0 = time.perf_counter()
                 resp = client().chat.completions.create(
                     model=model,
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
-            except RateLimitError as exc:
-                last_exc = exc
-                delay = 2 ** attempt
-                print(f"    [429] 限流，{delay}s 后重试")
-                time.sleep(delay)
-                continue
             latency_ms = int((time.perf_counter() - t0) * 1000)
+        except Exception as exc:  # noqa: BLE001 - 统一交给 classify 判定
+            err = classify(exc)
+            if not isinstance(err, RetryableError):
+                raise err from exc
+            last_exc = err
+            if attempt == 3:
+                break
+            delay = 2 ** attempt
+            print(f"    [重试] {type(exc).__name__}，{delay}s 后重试")
+            # 关键：退避在信号量外，不抱着许可睡觉
+            time.sleep(delay)
+            continue
 
         text = (resp.choices[0].message.content or "").strip()
         usage = resp.usage
@@ -133,10 +124,43 @@ def chat(
             prompt_tokens=pt, completion_tokens=ct,
             cost=cost, cached=False, latency_ms=latency_ms,
         ))
-
-        if can_cache:
-            cache.put(key, {"text": text})
-
         return Reply(text, model, pt, ct, cost, False, latency_ms)
 
-    raise RuntimeError(f"限流重试 3 次仍失败：{last_exc}")
+    raise RuntimeError(f"重试 3 次仍失败：{last_exc}")
+
+
+def chat(
+    messages: list[dict],
+    *,
+    step: str = "",
+    tier: str = "big",
+    temperature: float = 0.0,
+    max_tokens: int = 800,
+    use_cache: bool = True,
+    budget=None,
+) -> Reply:
+    model = pick_model(tier)
+    key = cache.make_key(model, messages, temperature, max_tokens, BASE_URL)
+
+    # 只缓存确定性调用；temperature > 0 时缓存等于抹掉随机性
+    can_cache = use_cache and temperature == 0
+
+    # 同 key 单飞：避免并发同时 miss -> 同一内容重复付费
+    guard = cache.key_lock(key) if can_cache else nullcontext()
+    with guard:
+        if can_cache:
+            hit = cache.get(key)
+            if hit:
+                if budget is not None:
+                    budget.spend(0)                # 命中不计 token，但计一次"调用"
+                log_call(CallRecord(
+                    ts=now_iso(), step=step, model=model,
+                    prompt_tokens=0, completion_tokens=0,
+                    cost=0.0, cached=True, latency_ms=0,
+                ))
+                return Reply(hit["text"], model, 0, 0, 0.0, True, 0)
+
+        reply = _request(model, messages, temperature, max_tokens, step, budget)
+        if can_cache:
+            cache.put(key, {"text": reply.text})
+        return reply

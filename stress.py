@@ -42,7 +42,8 @@ def main() -> int:
         print("没有配置 DEEPSEEK_API_KEY，请在 .env 里填好再跑")
         return 1
 
-    client = OpenAI(api_key=key, base_url=BASE_URL, timeout=60)
+    # max_retries=0：与 runner / llm 保持一致，避免预算低估真实请求数
+    client = OpenAI(api_key=key, base_url=BASE_URL, timeout=60, max_retries=0)
     results = []
 
     for i, topic in enumerate(TOPICS, start=1):

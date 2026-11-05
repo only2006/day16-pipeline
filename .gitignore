@@ -9,11 +9,11 @@ wheels/
 # Virtual environments
 .venv/
 
-# 密钥：绝不入库
-.env
+# 密钥：绝不入库（含 .env.local / .env.bak 等变体）
+.env*
+!.env.example
 
-# 运行产物
+# 运行产物（WAL 会生成 cache.db-wal / cache.db-shm）
 runs/
 logs/
-cache.db
-cache.db-journal
+cache.db*

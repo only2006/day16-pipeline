@@ -120,6 +120,21 @@ Day17 起改为**精确分项计费**（`pricing.py` 里输入 2.0 / 输出 8.0 
 
 > 单价是示例值，价格会调整，以 DeepSeek 官网为准；改 `pricing.py` 一张表即可，业务代码不用动。
 
+## 已修复的护栏缺陷（第二轮复查）
+
+| # | 问题 | 修法 |
+|---|---|---|
+| 1 | 429 退避的 `time.sleep` 在 `with _semaphore` 内，抱着许可睡 2/4/8s，其余线程全堵住 | sleep 移到信号量外 |
+| 2 | OpenAI SDK 默认 `max_retries=2`，一次 `create` 可能发 3 个真实请求而 `Budget` 只记 1 次 | 三处 `OpenAI(...)` 统一 `max_retries=0`，重试由 `llm._request` 明确管理 |
+| 3 | `Budget.check()` 只在事后判断次数，`max_calls=20` 会放到第 21 次调用 | 新增 `check(next_call=True)` 事前预检，`spend()` 与 `with_retry` 都用 |
+| 4 | 缓存键不含 `base_url`，换中转端点会命中旧端点的旧答案 | `make_key` 纳入 `base_url` |
+| 5 | `cache.get/put` 在并发下击穿，同 key 多线程同时 miss 会重复付费 | `cache.key_lock()` per-key 单飞 + double-check |
+| 6 | 只捕获 `RateLimitError`，超时/连接失败/5xx 绕过异常分类 | 复用 `infra.classify()` 统一判定 |
+| 7 | `.gitignore` 缺 `cache.db-wal/-shm` 与 `.env.*`；`stats.py` 遇损坏 `cache.db` 崩、JSONL 缺字段会 KeyError | 忽略规则改 `cache.db*` / `.env*`；`stats` 加损坏保护，`ledger.read_calls()` 逐行读 + 字段校验 |
+| 8 | `cache._connect()` 建表失败时连接没关，Windows 上文件句柄被占用（连临时目录都删不掉） | 异常路径 `conn.close()` 后再抛出 |
+
+> ⚠️ 缓存键加入 `base_url` 后，**旧 `cache.db` 里的缓存键全部失效**，第一次跑会重新冷启动（多花几分钱），属正常。`cache.py` 同时启用了 WAL，会产生 `cache.db-wal` / `-shm`，均已被忽略。
+
 ## 已知边界
 
 - `corpus.py` 是字符重合度检索，故意朴素 —— 考的是编排，不是检索质量。
